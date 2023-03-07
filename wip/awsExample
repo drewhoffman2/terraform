@@ -1,0 +1,532 @@
+[ec2-user@ip-172-31-27-127 data-storage]$ cd oracle
+[ec2-user@ip-172-31-27-127 oracle]$ ls
+examples  main.tf  main.tf.20200815  variables.tf
+[ec2-user@ip-172-31-27-127 oracle]$ cat examples 
+terraform workspace select Wolverines
+terraform plan -var="projectName=Wolverines" 
+terraform apply -auto-approve  -var="projectName=Wolverines" -var="db_name=goblue" 
+
+terraform workspace select Buckeyes
+terraform plan -var="projectName=Buckeyes"
+terraform apply -auto-approve  -var="projectName=Buckeyes" -var="db_name=suck"
+[ec2-user@ip-172-31-27-127 oracle]$ cat main.tf
+provider "aws" {
+  region                  = "${var.region}"
+  shared_credentials_files = ["${var.shared_credentials_file}"]
+  profile                 = "${var.profile}"
+}
+terraform {
+  backend "s3" {
+    #  backend cannot use variables...
+    bucket         = "funnelcloud-terraform-state"
+    key            = "prod/data-storage/oracle/terraform.tfstate"
+    region         = "us-west-2"
+    # Replace this with your DynamoDB table name!
+    dynamodb_table = "terraform-locks"
+    encrypt        = true
+  }
+}
+
+data "terraform_remote_state" "bastion" {
+  backend = "s3"
+  config = {
+    # Replace this with your bucket name!
+    bucket = "funnelcloud-terraform-state"
+    key    = "env:/${terraform.workspace}/prod/bastion-host/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
+data "terraform_remote_state" "s3" {
+  backend = "s3"
+  config = {
+    # Replace this with your bucket name!
+    bucket = "funnelcloud-terraform-state"
+    key    = "env:/${terraform.workspace}/prod/data-storage/s3/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+data "terraform_remote_state" "vpc" {
+  backend = "s3"
+  config = {
+    # Replace this with your bucket name!
+    bucket = "funnelcloud-terraform-state"
+    key    = "env:/${terraform.workspace}/prod/vpc/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
+resource "aws_volume_attachment" "ebs_att_db" {
+  device_name = "/dev/sdb"
+  volume_id   = "${aws_ebs_volume.db_disk.id}"
+  instance_id = "${aws_instance.db.id}"
+  skip_destroy = "true"
+
+
+  provisioner "remote-exec" {
+    inline = [
+     "sudo /root/3rp/full_part_disk.ksh -d /dev/xvdb -m /u02",
+     "sudo sleep 60",
+     "sudo -H -u oracle bash -c  \"/home/oracle/3rp/create_db_dbca.ksh -db ${var.db_name}\"",
+     "sudo -H -u oracle bash -c  \"/home/oracle/3rp/setup_db.ksh -db ${var.db_name}\"",
+     "sudo -H -u oracle bash -c  \"/home/oracle/3rp/s3_backup_setup.ksh -db ${var.db_name}\""
+    ]
+  }
+  connection {
+    type        = "ssh"
+    agent       = false
+    host        = "${aws_instance.db.private_ip}"
+    user        = "ec2-user"
+    private_key = "${file("${var.private_key}")}"
+
+    bastion_host        = data.terraform_remote_state.bastion.outputs.bastion_public_ip
+    bastion_private_key = "${file("${var.private_key}")}"
+  }
+}
+resource "aws_volume_attachment" "ebs_att_dbb" {
+  device_name = "/dev/sdc"
+  volume_id   = "${aws_ebs_volume.db_backup_disk.id}"
+  instance_id = "${aws_instance.db.id}"
+  skip_destroy = "true"
+
+  provisioner "remote-exec" {
+    inline = [
+     "sudo /root/3rp/full_part_disk.ksh -d /dev/xvdc -m /u03",
+    ]
+  }
+  connection {
+    type        = "ssh"
+    agent       = false
+    host        = "${aws_instance.db.private_ip}"
+    user        = "ec2-user"
+    private_key = "${file("${var.private_key}")}"
+
+    bastion_host        = data.terraform_remote_state.bastion.outputs.bastion_public_ip
+    bastion_private_key = "${file("${var.private_key}")}"
+  }
+}
+
+resource "aws_ebs_volume" "db_disk" {
+  availability_zone = "${var.privateAZ}"
+  size              = "${var.db_disk_GB}"
+  tags = {
+    Name = "${var.projectName} DB Disk"
+    Billing = "${var.projectName}"
+  }
+}
+resource "aws_ebs_volume" "db_backup_disk" {
+  availability_zone = "${var.privateAZ}"
+  size              = "${var.db_backup_disk_GB}"
+  tags = {
+    Name = "${var.projectName} DB Backup Disk"
+    Billing = "${var.projectName}"
+  }
+}
+
+resource "aws_instance" "db" {
+  ami = var.db_amis[var.db_version]
+  availability_zone = "${var.privateAZ}"
+  subnet_id = data.terraform_remote_state.vpc.outputs.private_subnet1
+  security_groups = [data.terraform_remote_state.vpc.outputs.bastion_back_sg]
+  instance_type = "t2.large"
+  associate_public_ip_address = "true"
+  key_name = "fcRuntime"
+  iam_instance_profile  = "${var.iamRole}"
+  tags = {
+    Name = "${var.projectName} DB"
+    Billing = "${var.projectName}"
+  }
+  connection {
+    type        = "ssh"
+    agent       = false
+    host        = "${self.private_ip}"
+    user        = "ec2-user"
+    private_key = "${file("${var.private_key}")}"
+
+    bastion_host        = data.terraform_remote_state.bastion.outputs.bastion_public_ip
+    bastion_private_key = "${file("${var.private_key}")}"
+  }
+  provisioner "remote-exec" {
+   inline = [
+     "sudo cat /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/listener.ora |sed s/10.0.2.203/`hostname`/ > /tmp/listener.ora",
+     "sudo cat /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/tnsnames.ora |sed s/10.0.2.203/${aws_instance.db.private_ip}/ | sed s/THREERP/${var.db_name}/ > /tmp/tnsnames.ora",
+     "sudo mv /tmp/listener.ora /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/listener.ora",
+     "sudo mv /tmp/tnsnames.ora /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/tnsnames.ora",
+     "sudo echo dbname ${var.db_name} > /tmp/db_name.ora",
+     "sudo echo s3 ${data.terraform_remote_state.s3.outputs.s3-backup-bucket}  >> /tmp/db_name.ora",
+     "sudo echo dbdisk ${aws_ebs_volume.db_disk.id} >> /tmp/db_name.ora",
+     "sudo echo dbBdisk ${aws_ebs_volume.db_backup_disk.id} >> /tmp/db_name.ora",
+     "sudo mv /tmp/db_name.ora /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/db_name.ora",
+     "sudo chown oracle:oinstall /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/*.ora",
+     "sudo mkdir  /home/oracle/3rp/",
+     "sudo mkdir  /root/3rp/",
+     "sudo chown oracle:oinstall /home/oracle/3rp/"
+     # "sudo /root/postClone/call_full_part_disk.ksh", 
+     # "sudo -H -u oracle bash -c  /root/postClone/create_db_dbca.ksh -db ${var.db_name}"
+   ]
+  }
+  provisioner "file" {
+    source = "${var.diskAddScript}"
+    destination = "/tmp/full_part_disk.ksh"
+  }
+
+  provisioner "file" {
+    source = "${var.dbCreateScript}"
+    destination = "/tmp/create_db_dbca.ksh"
+  }
+
+  provisioner "file" {
+    source = "${var.dbSnapScript}"
+    destination = "/tmp/snap_db.ksh"
+  }
+
+  provisioner "file" {
+    source = "${var.s3SetupScript}"
+    destination = "/tmp/s3_backup_setup.ksh"
+  }
+
+  provisioner "file" {
+    source = "${var.s3BackupScript}"
+    destination = "/tmp/s3_archive_backup.ksh"
+  }
+
+  provisioner "file" {
+    source = "${var.dbSetupScript}"
+    destination = "/tmp/setup_db.ksh"
+  }
+  
+  provisioner "file" {
+    source = "${var.s3JarFile}"
+    destination = "/tmp/osbws_install.jar"
+  }
+
+  provisioner "remote-exec" {
+     inline = [
+       "sudo mv /tmp/full_part_disk.ksh /root/3rp/full_part_disk.ksh",
+       "sudo mv /tmp/create_db_dbca.ksh /home/oracle/3rp/create_db_dbca.ksh",
+       "sudo chmod +x /root/3rp/full_part_disk.ksh",
+       "sudo chown oracle:oinstall /home/oracle/3rp/create_db_dbca.ksh",
+       "sudo chmod +x /home/oracle/3rp/create_db_dbca.ksh",
+       "sudo cat /tmp/snap_db.ksh | sed s/3RP_PROJECT/${var.projectName}/ |sed s/3RP_DB/${var.db_name}/ |sed s/3RP_VOLUME_DB/${aws_ebs_volume.db_disk.id}/| sed s/3RP_VOLUME_BACK/${aws_ebs_volume.db_backup_disk.id}/ >  /tmp/custom_snap_db.ksh",
+       "sudo mv /tmp/custom_snap_db.ksh /home/oracle/3rp/snap_db.ksh",
+       "sudo chown oracle:oinstall /home/oracle/3rp/snap_db.ksh",
+       "sudo chmod +x /home/oracle/3rp/snap_db.ksh",
+       "sudo mv /tmp/setup_db.ksh /home/oracle/3rp/setup_db.ksh",
+       "sudo chmod +x /home/oracle/3rp/setup_db.ksh",
+       "sudo chown oracle:oinstall /home/oracle/3rp/setup_db.ksh",
+       "sudo cat /tmp/s3_backup_setup.ksh | sed s/3RP_PROJECT/${var.projectName}/ >   /tmp/custom_s3_backup_setup.ksh",
+       "sudo mv /tmp/custom_s3_backup_setup.ksh /home/oracle/3rp/s3_backup_setup.ksh",
+       "sudo chown oracle:oinstall /home/oracle/3rp/s3_backup_setup.ksh",
+       "sudo chmod +x /home/oracle/3rp/s3_backup_setup.ksh",
+       "sudo cat /tmp/s3_archive_backup.ksh | sed s/3RP_PROJECT/${var.projectName}/ >   /tmp/custom_s3_archive_backup.ksh",
+       "sudo mv /tmp/custom_s3_archive_backup.ksh /home/oracle/3rp/s3_archive_backup.ksh",
+       "sudo chown oracle:oinstall /home/oracle/3rp/s3_archive_backup.ksh",
+       "sudo chmod +x /home/oracle/3rp/s3_archive_backup.ksh",
+       "sudo mv /tmp/osbws_install.jar  /home/oracle/3rp/osbws_install.jar",
+       "sudo chown oracle:oinstall /home/oracle/3rp/osbws_install.jar"
+     ]
+  }
+
+}[ec2-user@ip-172-31-27-127 oracle]$ 
+[ec2-user@ip-172-31-27-127 oracle]$ cat variables.tf 
+variable "projectName" {
+  default = "Lions"
+}
+variable "region" {
+  default = "us-west-2"
+}
+variable "publicAZ" {
+  default = "us-west-2b"
+}
+variable "privateAZ" {
+  default = "us-west-2a"
+}
+variable "shared_credentials_file" {
+  default = "/home/ec2-user/.aws/credentials"
+}
+variable "profile" {
+  default = "terraform"
+}
+
+# for to env
+variable "private_key" {
+  default = "~/.ssh/fcRuntime.pem"
+}
+
+variable "db_amis" {
+  type = map(string)
+  default = {
+    "EE-112" = "ami-054a43369914c0e84"
+    "SE-112" = "ami-0ab1bd5ef0a2d58c3"
+    "EE-122" = "ami-02e62f8e1e75b30f0"
+    "SE-122" = "ami-0e719a1f1c782eeb7"
+  }
+}
+variable "db_version" {
+  default = "EE-122"
+}
+
+variable "db_name" {
+   default = "ORCL"
+}
+
+variable "db_backup_disk_GB" {
+    default = "10"
+}
+variable "db_disk_GB" {
+    default = "20"
+}
+
+variable "diskAddScript" {
+  default = "/home/ec2-user/terraform/stage/full_part_disk.ksh"
+}
+
+variable "dbCreateScript" {
+  default = "/home/ec2-user/terraform/stage/create_db_dbca.ksh"
+}
+
+variable "dbSnapScript" {
+  default = "/home/ec2-user/terraform/stage/snap_db.ksh"
+}
+
+variable "dbSetupScript" {
+  default = "/home/ec2-user/terraform/stage/setup_db.ksh"
+}
+
+variable "s3SetupScript" {
+  default = "/home/ec2-user/terraform/stage/s3_backup_setup.ksh"
+}
+
+variable "s3JarFile" {
+  default = "/home/ec2-user/terraform/stage/osbws_install.jar"
+}
+
+variable "s3BackupScript" {
+  default = "/home/ec2-user/terraform/stage/s3_archive_backup.ksh"
+}
+
+variable "iamRole" {
+  default = "rmanBackup"
+}
+
+
+not sure wherd this varies
+[ec2-user@ip-172-31-27-127 oracle]$ cat main.tf.20200815 
+provider "aws" {
+  region                  = "${var.region}"
+  shared_credentials_file = "${var.shared_credentials_file}"
+  profile                 = "${var.profile}"
+}
+terraform {
+  backend "s3" {
+    #  backend cannot use variables...
+    bucket         = "funnelcloud-terraform-state"
+    key            = "prod/data-storage/oracle/terraform.tfstate"
+    region         = "us-west-2"
+    # Replace this with your DynamoDB table name!
+    dynamodb_table = "terraform-locks"
+    encrypt        = true
+  }
+}
+
+data "terraform_remote_state" "bastion" {
+  backend = "s3"
+  config = {
+    # Replace this with your bucket name!
+    bucket = "funnelcloud-terraform-state"
+    key    = "env:/${terraform.workspace}/prod/bastion-host/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
+data "terraform_remote_state" "s3" {
+  backend = "s3"
+  config = {
+    # Replace this with your bucket name!
+    bucket = "funnelcloud-terraform-state"
+    key    = "env:/${terraform.workspace}/prod/data-storage/s3/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+data "terraform_remote_state" "vpc" {
+  backend = "s3"
+  config = {
+    # Replace this with your bucket name!
+    bucket = "funnelcloud-terraform-state"
+    key    = "env:/${terraform.workspace}/prod/vpc/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
+resource "aws_volume_attachment" "ebs_att_db" {
+  device_name = "/dev/sdb"
+  volume_id   = "${aws_ebs_volume.db_disk.id}"
+  instance_id = "${aws_instance.db.id}"
+  skip_destroy = "true"
+
+
+  provisioner "remote-exec" {
+    inline = [
+     "sudo /root/3rp/full_part_disk.ksh -d /dev/xvdb -m /u02",
+     "sudo sleep 60",
+     "sudo -H -u oracle bash -c  \"/home/oracle/3rp/create_db_dbca.ksh -db ${var.db_name}\"",
+     "sudo -H -u oracle bash -c  \"/home/oracle/3rp/setup_db.ksh -db ${var.db_name}\"",
+     "sudo -H -u oracle bash -c  \"/home/oracle/3rp/s3_backup_setup.ksh -db ${var.db_name}\""
+    ]
+  }
+  connection {
+    type        = "ssh"
+    agent       = false
+    host        = "${aws_instance.db.private_ip}"
+    user        = "ec2-user"
+    private_key = "${file("${var.private_key}")}"
+
+    bastion_host        = data.terraform_remote_state.bastion.outputs.bastion_public_ip
+    bastion_private_key = "${file("${var.private_key}")}"
+  }
+}
+resource "aws_volume_attachment" "ebs_att_dbb" {
+  device_name = "/dev/sdc"
+  volume_id   = "${aws_ebs_volume.db_backup_disk.id}"
+  instance_id = "${aws_instance.db.id}"
+  skip_destroy = "true"
+
+  provisioner "remote-exec" {
+    inline = [
+     "sudo /root/3rp/full_part_disk.ksh -d /dev/xvdc -m /u03",
+    ]
+  }
+  connection {
+    type        = "ssh"
+    agent       = false
+    host        = "${aws_instance.db.private_ip}"
+    user        = "ec2-user"
+    private_key = "${file("${var.private_key}")}"
+
+    bastion_host        = data.terraform_remote_state.bastion.outputs.bastion_public_ip
+    bastion_private_key = "${file("${var.private_key}")}"
+  }
+}
+
+resource "aws_ebs_volume" "db_disk" {
+  availability_zone = "${var.privateAZ}"
+  size              = "${var.db_disk_GB}"
+  tags = {
+    Name = "${var.projectName} DB Disk"
+    Billing = "${var.projectName}"
+  }
+}
+resource "aws_ebs_volume" "db_backup_disk" {
+  availability_zone = "${var.privateAZ}"
+  size              = "${var.db_backup_disk_GB}"
+  tags = {
+    Name = "${var.projectName} DB Backup Disk"
+    Billing = "${var.projectName}"
+  }
+}
+
+resource "aws_instance" "db" {
+  ami = var.db_amis[var.db_version]
+  availability_zone = "${var.privateAZ}"
+  subnet_id = data.terraform_remote_state.vpc.outputs.private_subnet
+  security_groups = [data.terraform_remote_state.vpc.outputs.bastion_back_sg]
+  instance_type = "t2.large"
+  associate_public_ip_address = "true"
+  key_name = "fcRuntime"
+  iam_instance_profile  = "${var.iamRole}"
+  tags = {
+    Name = "${var.projectName} DB"
+    Billing = "${var.projectName}"
+  }
+  connection {
+    type        = "ssh"
+    agent       = false
+    host        = "${self.private_ip}"
+    user        = "ec2-user"
+    private_key = "${file("${var.private_key}")}"
+
+    bastion_host        = data.terraform_remote_state.bastion.outputs.bastion_public_ip
+    bastion_private_key = "${file("${var.private_key}")}"
+  }
+  provisioner "remote-exec" {
+   inline = [
+     "sudo cat /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/listener.ora |sed s/10.0.2.203/`hostname`/ > /tmp/listener.ora",
+     "sudo cat /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/tnsnames.ora |sed s/10.0.2.203/${aws_instance.db.private_ip}/ | sed s/THREERP/${var.db_name}/ > /tmp/tnsnames.ora",
+     "sudo mv /tmp/listener.ora /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/listener.ora",
+     "sudo mv /tmp/tnsnames.ora /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/tnsnames.ora",
+     "sudo echo dbname ${var.db_name} > /tmp/db_name.ora",
+     "sudo echo s3 ${data.terraform_remote_state.s3.outputs.s3-backup-bucket}  >> /tmp/db_name.ora",
+     "sudo echo dbdisk ${aws_ebs_volume.db_disk.id} >> /tmp/db_name.ora",
+     "sudo echo dbBdisk ${aws_ebs_volume.db_backup_disk.id} >> /tmp/db_name.ora",
+     "sudo mv /tmp/db_name.ora /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/db_name.ora",
+     "sudo chown oracle:oinstall /u01/app/oracle/product/12.2.0/dbhome_1/network/admin/*.ora",
+     "sudo mkdir  /home/oracle/3rp/",
+     "sudo mkdir  /root/3rp/",
+     "sudo chown oracle:oinstall /home/oracle/3rp/"
+     # "sudo /root/postClone/call_full_part_disk.ksh", 
+     # "sudo -H -u oracle bash -c  /root/postClone/create_db_dbca.ksh -db ${var.db_name}"
+   ]
+  }
+  provisioner "file" {
+    source = "${var.diskAddScript}"
+    destination = "/tmp/full_part_disk.ksh"
+  }
+
+  provisioner "file" {
+    source = "${var.dbCreateScript}"
+    destination = "/tmp/create_db_dbca.ksh"
+  }
+
+  provisioner "file" {
+    source = "${var.dbSnapScript}"
+    destination = "/tmp/snap_db.ksh"
+  }
+
+  provisioner "file" {
+    source = "${var.s3SetupScript}"
+    destination = "/tmp/s3_backup_setup.ksh"
+  }
+
+  provisioner "file" {
+    source = "${var.s3BackupScript}"
+    destination = "/tmp/s3_archive_backup.ksh"
+  }
+
+  provisioner "file" {
+    source = "${var.dbSetupScript}"
+    destination = "/tmp/setup_db.ksh"
+  }
+  
+  provisioner "file" {
+    source = "${var.s3JarFile}"
+    destination = "/tmp/osbws_install.jar"
+  }
+
+  provisioner "remote-exec" {
+     inline = [
+       "sudo mv /tmp/full_part_disk.ksh /root/3rp/full_part_disk.ksh",
+       "sudo mv /tmp/create_db_dbca.ksh /home/oracle/3rp/create_db_dbca.ksh",
+       "sudo chmod +x /root/3rp/full_part_disk.ksh",
+       "sudo chown oracle:oinstall /home/oracle/3rp/create_db_dbca.ksh",
+       "sudo chmod +x /home/oracle/3rp/create_db_dbca.ksh",
+       "sudo cat /tmp/snap_db.ksh | sed s/3RP_PROJECT/${var.projectName}/ |sed s/3RP_DB/${var.db_name}/ |sed s/3RP_VOLUME_DB/${aws_ebs_volume.db_disk.id}/| sed s/3RP_VOLUME_BACK/${aws_ebs_volume.db_backup_disk.id}/ >  /tmp/custom_snap_db.ksh",
+       "sudo mv /tmp/custom_snap_db.ksh /home/oracle/3rp/snap_db.ksh",
+       "sudo chown oracle:oinstall /home/oracle/3rp/snap_db.ksh",
+       "sudo chmod +x /home/oracle/3rp/snap_db.ksh",
+       "sudo mv /tmp/setup_db.ksh /home/oracle/3rp/setup_db.ksh",
+       "sudo chmod +x /home/oracle/3rp/setup_db.ksh",
+       "sudo chown oracle:oinstall /home/oracle/3rp/setup_db.ksh",
+       "sudo cat /tmp/s3_backup_setup.ksh | sed s/3RP_PROJECT/${var.projectName}/ >   /tmp/custom_s3_backup_setup.ksh",
+       "sudo mv /tmp/custom_s3_backup_setup.ksh /home/oracle/3rp/s3_backup_setup.ksh",
+       "sudo chown oracle:oinstall /home/oracle/3rp/s3_backup_setup.ksh",
+       "sudo chmod +x /home/oracle/3rp/s3_backup_setup.ksh",
+       "sudo cat /tmp/s3_archive_backup.ksh | sed s/3RP_PROJECT/${var.projectName}/ >   /tmp/custom_s3_archive_backup.ksh",
+       "sudo mv /tmp/custom_s3_archive_backup.ksh /home/oracle/3rp/s3_archive_backup.ksh",
+       "sudo chown oracle:oinstall /home/oracle/3rp/s3_archive_backup.ksh",
+       "sudo chmod +x /home/oracle/3rp/s3_archive_backup.ksh",
+       "sudo mv /tmp/osbws_install.jar  /home/oracle/3rp/osbws_install.jar",
+       "sudo chown oracle:oinstall /home/oracle/3rp/osbws_install.jar"
+     ]
+  }
+
+}
